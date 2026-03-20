@@ -1,0 +1,1315 @@
+---
+title: "Space for time substitution"
+output: html_notebook
+---
+
+# Set up
+
+```{r}
+library(magrittr)
+library(Mapinguari)
+```
+
+# Prepare climatic data
+
+```{r, eval = FALSE}
+climate_files <-
+  list.files("Clima_INMET", full.names = TRUE)
+
+climate_list <-
+  lapply(climate_files, read.csv, skip = 8, row.names = NULL, sep = ";", check.names = F)
+
+climate_df <-
+  lapply(climate_list, function(x){
+    
+    names(x) <- 
+      names(climate_list[[1]])
+    
+    return(x)
+    
+  }) %>% 
+  do.call(rbind, .)
+
+climate_df <- climate_df[c(1,3,8,16)]
+
+names(climate_df) <- c("date",
+                       "precip",
+                       "temp",
+                       "humi")
+
+climate_df$date <- lubridate::ymd(climate_df$date)
+climate_df$doy <- lubridate::yday(climate_df$date)
+climate_df$year <- lubridate::year(climate_df$date)
+climate_df$month <- lubridate::month(climate_df$date)
+climate_df$day <- lubridate::day(climate_df$date)
+
+climate_df$precip <- stringr::str_replace(climate_df$precip, ",", ".") %>% as.numeric()
+climate_df$temp <- stringr::str_replace(climate_df$temp, ",", ".") %>% as.numeric()
+climate_df$humi <- stringr::str_replace(climate_df$humi, ",", ".") %>% as.numeric()
+climate_df$daylength <- geosphere::daylength(lat = -15.9, doy = climate_df$doy)
+
+climate_df$breed <- "nb"
+climate_df$breed[climate_df$month %in% c(1,2,8:12)] <- "b"
+
+climate_df$month <- as.character(climate_df$month)
+
+one_digit <- 
+  climate_df$month %in% c("1", "2", "3", 
+                          "4", "5", "6", 
+                          "7", "8", "9")
+
+climate_df$month[one_digit] <- 
+  paste0("0", climate_df$month[one_digit])
+
+climate_df$campaign <- paste0(climate_df$year, "_", climate_df$month)
+
+climate_df <- climate_df[!climate_df$campaign %in% c("2000_05", "2025_10", "2025_11"),]
+
+climate_df <- 
+  climate_df[!is.na(climate_df$precip) & climate_df$precip >= 0,]
+
+climate_df <- 
+  climate_df[!is.na(climate_df$temp) & climate_df$temp >= 0,]
+
+write.csv(climate_df, "climate_df.csv", row.names = FALSE)
+```
+
+# Calculate hours of activity
+
+```{r}
+gradient_temps <- 
+  TtorquatusGradient$temp[!TtorquatusGradient$temp %in% boxplot.stats(TtorquatusGradient$temp)$out]
+
+VTmin <- quantile(gradient_temps, 0.05)
+VTmax <- quantile(gradient_temps, 0.95)
+```
+
+Calculate hours of activity for Brasília
+
+```{r}
+climate_df <- read.csv("climate_df.csv")
+
+climate_df$month <- as.factor(climate_df$month)
+climate_df$year <- as.factor(climate_df$year)
+
+climate_day <-
+  climate_df %>% 
+  dplyr::group_by(date) %>% 
+  dplyr::summarise(precip = sum(precip),
+                   tempavg = mean(temp),
+                   tempmax = max(temp),
+                   tempmin = min(temp),
+                   daylength = mean(daylength),
+                   breed = unique(breed),
+                   campaign = unique(campaign),
+                   month = unique(month),
+                   year = unique(year))
+
+climate_day$ha_vt <- 
+  sin_h(tmax = climate_day$tempmax, tmin = climate_day$tempmin, thrs = VTmin, res = 3) - 
+  sin_h(tmax = climate_day$tempmax, tmin = climate_day$tempmin, thrs = VTmax, res = 3)
+```
+
+Cap by daylength
+
+```{r}
+climate_day$ha_vt_cap <- 
+  ifelse(climate_day$ha_vt < climate_day$daylength, 
+         climate_day$ha_vt, 
+         climate_day$daylength)
+```
+
+Summarize by campaign
+
+```{r}
+climate_campaign <-
+  climate_day %>% 
+  dplyr::group_by(campaign) %>% 
+  dplyr::summarise(precip = sum(precip),
+                   tempavg = mean(tempavg),
+                   tempmax = max(tempmax),
+                   tempmin = min(tempmin),
+                   ha_vt_cap = sum(ha_vt_cap),
+                   daylength = mean(daylength),
+                   breed = unique(breed),
+                   month = unique(month),
+                   year = unique(year))
+
+climate_campaign$breed <- as.factor(climate_campaign$breed)
+```
+
+# Run mark and recapture models
+
+```{r}
+ttorquatus <- read.csv("torquatus_data.csv")
+
+one_digit <- 
+  ttorquatus$mes %in% c("1", "2", "3", 
+                        "4", "5", "6", 
+                        "7", "8", "9")
+
+ttorquatus$mes[one_digit] <- 
+  paste0("0", ttorquatus$mes[one_digit])
+
+
+ttorquatus$campaign <- paste0(ttorquatus$ano, "_", ttorquatus$mes)
+
+ttorquatus <- ttorquatus[!ttorquatus$campaign %in% c("2000_05", "2025_10", "2025_11"),]
+
+cap_history <-
+  data.frame(campaign = ttorquatus$campaign,
+             ident = ttorquatus$ident)
+
+cap_history <-
+  cap_history[complete.cases(cap_history),]
+
+cap_history <-
+  unique(cap_history)
+```
+
+UCARE 
+
+```{r}
+ttorquatus$captured <- 1L
+
+X_ind <- stats::xtabs(captured ~ ident + campanha, data = ttorquatus)
+
+X_ind <- (X_ind > 0) * 1L
+X_ind <- as.matrix(X_ind)
+
+ch <- apply(X_ind, 1, paste0, collapse = "")
+tab <- table(ch)
+
+X <- matrix(
+  as.integer(unlist(strsplit(names(tab), ""))),
+  nrow = length(tab),
+  byrow = TRUE
+)
+freq <- as.integer(tab)
+
+R2ucare::test3sr(X, freq)
+R2ucare::test3sm(X, freq)
+R2ucare::test2ct(X, freq)
+R2ucare::test2cl(X, freq)
+```
+
+```{r}
+climate_campaign$session <- factor(climate_campaign$campaign,
+                                   levels = unique(climate_campaign$campaign))
+
+climate_campaign$session <- as.numeric(climate_campaign$session)
+
+cap_history$ident <- 
+  factor(cap_history$ident, 
+         levels = unique(cap_history$ident)) %>% 
+  as.numeric
+
+cap_history$campaign <-
+  climate_campaign$session[match(cap_history$campaign,
+                                 climate_campaign$campaign)]
+
+names(cap_history) <- c("session", "ID")
+```
+
+```{r}
+cap_history$occasion <- 1
+
+cap_history$x <- 1
+cap_history$y <- 1
+
+dummy_traps <-
+  data.frame(trapID = 1,
+             x = 1,
+             y = 1) %>% 
+  secr::read.traps(data = .)
+
+capthist <-
+  secr::make.capthist(cap_history,dummy_traps,"XY")
+
+sessions_unq <- 
+  cap_history$session %>% 
+  unique %>% 
+  sort
+
+session_intervals <- sessions_unq[-1] - sessions_unq[-length(sessions_unq)]
+
+secr::intervals(capthist) <- session_intervals
+```
+
+```{r}
+cand <- list(
+  phi = list(
+    # phi~tempmax,
+    # phi~precip,
+    # phi~ha_vt_cap,
+    phi~tempmax + precip,
+    phi~ha_vt_cap + precip,
+    # phi~tempmax:breed,
+    # phi~precip:breed,
+    # phi~ha_vt_cap:breed,
+    phi~tempmax:breed + precip:breed,
+    phi~ha_vt_cap:breed + precip:breed
+  ),
+  p = list(
+    p~B+month+year
+  ),
+  gamma = list(
+    # gamma~tempmax,
+    # gamma~precip,
+    # gamma~ha_vt_cap,
+    gamma~tempmax + precip,
+    gamma~ha_vt_cap + precip,
+    # gamma~tempmax:breed,
+    # gamma~precip:breed,
+    # gamma~ha_vt_cap:breed,
+    gamma~tempmax:breed + precip:breed,
+    gamma~ha_vt_cap:breed + precip:breed
+  )
+)
+
+# all combinations
+grid <- expand.grid(
+  phi = 1:length(cand$phi),
+  p = 1:length(cand$p),
+  gamma = 1:length(cand$gamma)
+)
+
+climate_sessions <- climate_campaign[climate_campaign$session %in% cap_history$session,]
+
+climate_sessions$precip <- scale(climate_sessions$precip)
+climate_sessions$tempavg <- scale(climate_sessions$tempavg)
+climate_sessions$tempmax <- scale(climate_sessions$tempmax)
+climate_sessions$ha_vt_cap <- scale(climate_sessions$ha_vt_cap)
+```
+
+```{r}
+cl <- parallel::makeCluster(7)
+parallel::clusterExport(cl, "cand")
+parallel::clusterExport(cl, "grid")
+parallel::clusterExport(cl, "capthist")
+parallel::clusterExport(cl, "climate_sessions")
+
+pradel_models <-
+  pbapply::pblapply(cl = cl, 1:nrow(grid), function(i){
+    
+    this_phi <- cand$phi[grid$phi[i]][[1]]
+    this_p <- cand$p[grid$p[i]][[1]]
+    this_gamma <- cand$gamma[grid$gamma[i]][[1]]
+    
+    formula <- list(
+      p = this_p,
+      phi = this_phi,
+      gamma = this_gamma
+    )
+    
+    openCR::openCR.fit(
+      capthist,
+      type = "Pradelg",
+      model = formula,
+      sessioncov = climate_sessions
+    )
+    
+  })
+
+parallel::stopCluster(cl)
+
+names(pradel_models) <- 
+  paste(cand$p[grid$p], 
+        cand$phi[grid$phi], 
+        cand$gamma[grid$gamma])
+
+names(pradel_models) <- stringr::str_replace_all(names(pradel_models), " ~ ", "~")
+
+saveRDS(pradel_models, "pradel_models2.rds")
+```
+
+```{r}
+null_model <- 
+  openCR::openCR.fit(
+    capthist,
+    type = "Pradelg",
+    model = list(p ~ 1, phi ~ B, gamma ~ 1)
+  )
+
+full_model <-
+  openCR::openCR.fit(
+    capthist,
+    type = "Pradelg",
+    model = list(p ~ t, phi ~ B, gamma ~ t)
+  )
+
+saveRDS(null_model, "null_model.rds")
+saveRDS(full_model, "full_model.rds")
+```
+
+```{r}
+AIC_mod <-
+  function (object, ..., sort = TRUE, k = 2, dmax = 10, use.rank = FALSE, 
+            svtol = 1e-05, criterion = c("AIC", "AICc"), n = NULL, modelnames = NULL){
+    if (k != 2) 
+      stop("'AIC.openCR' defined only for k = 2")
+    allargs <- list(...)
+    if(is.null(modelnames)){
+      modelnames <- (c(as.character(match.call(expand.dots = FALSE)$object), 
+                       as.character(match.call(expand.dots = FALSE)$...)))
+    }
+    allargs <- openCR::openCRlist(object, allargs)
+    names(allargs) <- modelnames
+    AIC(allargs, sort = sort, k = k, dmax = dmax, use.rank = use.rank, 
+        svtol = svtol, criterion = criterion, n = n)
+  }
+```
+
+```{r}
+pradel_models <- readRDS("pradel_models2.rds")
+# pradel_models2 <- readRDS("pradel_models2.rds")
+null_model <- readRDS("null_model.rds")
+full_model <- readRDS("full_model.rds")
+
+all_models <- c(pradel_models,
+                # pradel_models2,
+                list(null_model),
+                list(full_model)
+)
+
+names_list <- c("object", paste0("fit", 2:length(all_models)))
+
+aic_table <-
+  do.call(AIC_mod, 
+          c(all_models, 
+            modelnames = list(names_list)))
+
+write.csv(aic_table, "aic_table.csv")
+```
+
+```{r}
+names(all_models)[length(all_models)-1] <- "p~1 phi~1 gamma~1"
+names(all_models)[length(all_models)] <- "p~t phi~t gamma~t"
+
+all_models_reorder <- 
+  all_models[match(aic_table$model,
+                   names(all_models))]
+
+best_model <- summary(all_models_reorder[[1]])
+
+phi_model <- best_model$predicted$phi$estimate
+gamma_model <- best_model$predicted$gamma$estimate
+
+f_model <- 
+  phi_model*(1-gamma_model[c(2:246,1)])/
+  gamma_model[c(2:246,1)]
+
+gamma_table <-
+best_model$predicted$gamma
+
+gamma_table$f <- f_model
+
+f_year <-
+gamma_table %>%
+  dplyr::group_by(year) %>% 
+  dplyr::summarise(f = sum(f, na.rm = TRUE))
+  
+coefs1 <- best_model$coef
+```
+
+```{r}
+climate_sessions <- 
+  climate_campaign[climate_campaign$session %in% 
+                     cap_history$session,]
+
+phiFUN <-
+  function(tempmax, precip, breed){
+    
+    precip_scaled <-
+      (precip - mean(climate_sessions$precip))/
+      sd(climate_sessions$precip - 
+           mean(climate_sessions$precip))
+    
+    tempmax_scaled <-
+      (tempmax - mean(climate_sessions$tempmax))/
+      sd(climate_sessions$tempmax - 
+           mean(climate_sessions$tempmax))
+    
+        n_breed <- -(breed-1)
+    
+    precip_b <- precip_scaled*breed
+    precip_nb <- precip_scaled*n_breed
+    
+    tempmax_b <- tempmax_scaled*breed
+    tempmax_nb <- tempmax_scaled*n_breed
+    
+    phi_b <-
+      (-0.43698676*tempmax_b + 
+      0.16640005*precip_b +
+      2.54165997)*breed
+    
+    phi_nb <-
+      (-0.28634382*tempmax_nb + 
+      -0.95440903*precip_nb +
+      2.54165997)*n_breed
+    
+    phi <-1/(1 + exp(-(phi_b+phi_nb)))
+    
+    return(phi)
+    
+  }
+
+gammaFUN <-
+  function(ha_vt_cap, precip, breed){
+    
+    precip_scaled <-
+      (precip - mean(climate_sessions$precip))/
+      sd(climate_sessions$precip - 
+           mean(climate_sessions$precip))
+    
+    ha_vt_cap_scaled <-
+      (ha_vt_cap - mean(climate_sessions$ha_vt_cap))/
+      sd(climate_sessions$ha_vt_cap - 
+           mean(climate_sessions$ha_vt_cap))
+    
+    n_breed <- -(breed-1)
+    
+    precip_b <- precip_scaled*breed
+    precip_nb <- precip_scaled*n_breed
+    
+    ha_b <- ha_vt_cap_scaled*breed
+    ha_nb <- ha_vt_cap_scaled*n_breed
+    
+    gamma_b <-
+      (-0.38909269*ha_b + 
+      2.80583442*precip_b +
+      4.09197087)*breed
+    
+    gamma_nb <-
+      (0.48543295*ha_nb + 
+      1.77392199*precip_nb +
+      4.09197087)*n_breed
+    
+    gamma <-1/(1 + exp(-(gamma_b+gamma_nb)))
+    
+    return(gamma)
+    
+  }
+```
+
+```{r}
+tt_breeding_stack <- 
+  terra::rast("C:/Users/gabri/Dropbox/Projetos/Tese/Ch3/Analysis/breed_stack_tt_present.grd")
+
+tt_breeding_binary <-
+  tt_breeding_stack > 0.5
+```
+
+```{r}
+biomas <-
+  geobr::read_biomes()
+
+cerrado_mata <- 
+  biomas[biomas$name_biome %in% c("Cerrado", 
+                                  "Mata Atlântica"),]
+
+cerrado_mata <-
+  sf::st_transform(cerrado_mata, 
+                   sf::st_crs(tt_breeding_binary))
+
+# tt_breeding_binary <- 
+#   terra::mask(tt_breeding_binary, cerrado_mata) %>% 
+#   terra::crop(cerrado_mata)
+
+wc_tmax <-
+  geodata::worldclim_country("BR", 
+                             "tmax", 
+                             "worlclim") %>% 
+  terra::project(tt_breeding_binary) %>% 
+  terra::resample(tt_breeding_binary) 
+# %>% 
+# terra::mask(cerrado_mata) %>% 
+# terra::crop(cerrado_mata)
+
+wc_tmin <-
+  geodata::worldclim_country("BR", 
+                             "tmin", 
+                             "worlclim") %>% 
+  terra::project(tt_breeding_binary) %>% 
+  terra::resample(tt_breeding_binary) 
+# %>% 
+#   terra::mask(cerrado_mata) %>% 
+#   terra::crop(cerrado_mata)
+
+wc_prec <-
+  geodata::worldclim_country("BR", 
+                             "prec", 
+                             "worlclim") %>% 
+  terra::project(tt_breeding_binary) %>% 
+  terra::resample(tt_breeding_binary) 
+# %>% 
+#   terra::mask(cerrado_mata) %>% 
+#   terra::crop(cerrado_mata)
+```
+
+```{r}
+tmax_values <- terra::values(wc_tmax)
+tmin_values <- terra::values(wc_tmin)
+
+tmax_values_nona <- tmax_values[!(is.na(tmax_values)|is.na(tmin_values))]
+tmin_values_nona <- tmin_values[!(is.na(tmax_values)|is.na(tmin_values))]
+
+above_vtmin <-
+  sin_h(tmax = tmax_values_nona, 
+        tmin = tmin_values_nona, 
+        thrs = VTmin, 
+        res = 3) 
+
+above_vtmax <-
+  sin_h(tmax = tmax_values_nona, 
+        tmin = tmin_values_nona, 
+        thrs = VTmax, 
+        res = 3) 
+
+ha_vt_values <-
+  above_vtmin -
+  above_vtmax
+
+ha_vt_rast <- wc_tmax
+
+terra::values(ha_vt_rast)[!is.na(terra::values(ha_vt_rast))] <- 
+  ha_vt_values
+```
+
+```{r}
+dl_rast <- wc_tmax
+
+lat <- 
+  terra::yFromRow(dl_rast, 
+                  1:nrow(dl_rast))
+
+mid_month_doy <-
+  c(15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349)
+
+d <- sapply(mid_month_doy, function(i) geosphere::daylength(lat, i))
+
+terra::values(dl_rast) <- rep(d, 
+                              each=ncol(dl_rast))
+
+dl_rast[is.na(ha_vt_rast)] <- NA
+```
+
+```{r}
+ha_vt_rast_cap <- ha_vt_rast
+
+ha_vt_rast_cap[ha_vt_rast_cap > dl_rast] <- dl_rast
+
+ha_vt_rast_cap[[1]] <- ha_vt_rast_cap[[1]]*31
+ha_vt_rast_cap[[2]] <- ha_vt_rast_cap[[2]]*28
+ha_vt_rast_cap[[3]] <- ha_vt_rast_cap[[3]]*31
+ha_vt_rast_cap[[4]] <- ha_vt_rast_cap[[4]]*30
+ha_vt_rast_cap[[5]] <- ha_vt_rast_cap[[5]]*31
+ha_vt_rast_cap[[6]] <- ha_vt_rast_cap[[6]]*30
+ha_vt_rast_cap[[7]] <- ha_vt_rast_cap[[7]]*31
+ha_vt_rast_cap[[8]] <- ha_vt_rast_cap[[8]]*31
+ha_vt_rast_cap[[9]] <- ha_vt_rast_cap[[9]]*30
+ha_vt_rast_cap[[10]] <- ha_vt_rast_cap[[10]]*31
+ha_vt_rast_cap[[11]] <- ha_vt_rast_cap[[11]]*30
+ha_vt_rast_cap[[12]] <- ha_vt_rast_cap[[12]]*31
+
+saveRDS(ha_vt_rast_cap, "ha_vt_rast_cap.rds")
+```
+
+```{r}
+jiggle_points <- function(df, reference_raster, max_dist = 5000){
+  
+  extract_original <-
+    terra::extract(reference_raster, 
+                   df)
+  
+  which_missing <- 
+    which(!complete.cases(extract_original))
+  
+  missing_coords <-
+    df[which_missing,]
+  
+  missing_coords <- 
+    terra::vect(missing_coords, 
+                crs = terra::crs(reference_raster))
+  
+  buffer_points <-
+    terra::buffer(missing_coords, max_dist) 
+  
+  new_coords <-
+    lapply(1:nrow(buffer_points), function(i){
+      
+      cropped_buffer <-
+        terra::crop(reference_raster, 
+                     buffer_points[i,])
+      
+      na_dist <-
+        terra::distance(cropped_buffer, 
+                        missing_coords[i,])
+      
+      terra::values(na_dist)[is.na(terra::values(cropped_buffer))] <- NA
+      
+      terra::xyFromCell(na_dist, 
+                        which.min(terra::values(na_dist))) 
+      
+    }) %>% 
+    do.call(rbind, .)
+  
+  df2 <- df
+  
+  df2[which_missing,] <- new_coords
+  
+  df2
+  
+}
+```
+
+```{r}
+tt_breeding <-
+  Mapinguari::TtorquatusBreeding
+
+tt_breeding[1:2] <- 
+  jiggle_points(tt_breeding[1:2],
+                wc_prec[[1]])
+
+tt_breeding$site <- 1:nrow(tt_breeding)
+
+tt_breeding_long <- 
+  tidyr::pivot_longer(tt_breeding, 
+                      January:December,
+                      names_to = "month", values_to = "repro")
+
+tt_breeding_long$repro <- factor(tt_breeding_long$repro)
+
+tt_breeding_long$month_num <- 
+  match(tt_breeding_long$month, 
+        month.name)
+
+tt_breeding_long$month_angle <- 
+  2*pi*(tt_breeding_long$month_num-1)/12
+
+tt_breeding_long$sin_month <- 
+  sin(tt_breeding_long$month_angle)
+
+tt_breeding_long$cos_month <- 
+  cos(tt_breeding_long$month_angle)
+
+tt_breeding_long$prec <- 
+  sapply(1:nrow(tt_breeding_long), function(i){
+    
+    coords <- tt_breeding_long[i,1:2]
+    month <-  tt_breeding_long[i,]$month_num
+    
+    terra::extract(wc_prec[[month]], coords)[2]
+    
+  }) %>% 
+  unlist
+
+tt_breeding_long$tmax <- 
+  sapply(1:nrow(tt_breeding_long), function(i){
+    
+    coords <- tt_breeding_long[i,1:2]
+    month <-  tt_breeding_long[i,]$month_num
+    
+    terra::extract(wc_tmax[[month]], coords)[2]
+    
+  }) %>% 
+  unlist
+
+tt_breeding_long$ha_vt_cap <- 
+  sapply(1:nrow(tt_breeding_long), function(i){
+    
+    coords <- tt_breeding_long[i,1:2]
+    month <-  tt_breeding_long[i,]$month_num
+    
+    terra::extract(ha_vt_rast_cap[[month]], coords)[2]
+    
+  }) %>% 
+  unlist
+
+tt_breeding_long$dl <- 
+  sapply(1:nrow(tt_breeding_long), function(i){
+    
+    coords <- tt_breeding_long[i,1:2]
+    month <-  tt_breeding_long[i,]$month_num
+    
+    terra::extract(dl_rast[[month]], coords)[2]
+    
+  }) %>% 
+  unlist
+```
+
+```{r}
+set.seed(1)
+
+test_sites <- 
+  sample(unique(tt_breeding_long$site), 
+         size = 3)
+
+train_df  <- tt_breeding_long[!tt_breeding_long$site %in% test_sites, ]
+test_df  <- tt_breeding_long[tt_breeding_long$site %in% test_sites, ]
+
+
+library(mgcv)
+
+knots_list <- list(month_num = c(0.5, 12.5))
+
+m_gamm <- mgcv::gam(
+  repro ~
+    s(month_num, bs = "cc", k = 12) +        
+    s(Lon, Lat, bs = "tp", k = 11) +        
+    prec + 
+    tmax +
+    ha_vt_cap +
+    dl,
+  family = stats::binomial(link = "logit"),
+  data = train_df,
+  method = "REML",
+  knots = knots_list
+)
+
+# rf <- randomForest::randomForest(
+#   repro ~ sin_month + 
+#     cos_month + 
+#     prec + 
+#     tmax + 
+#     ha_vt_cap + 
+#     dl +
+#     Lon +
+#     Lat,
+#   data = train_df,
+#   ntree = 500
+# )
+
+p <- 
+  predict(m_gamm, newdata = test_df) %>% 
+  plogis
+
+p[p>0.5] <- 1
+p[p<0.5] <- 0
+
+p <- factor(p)
+
+y <- 
+  test_df$repro
+
+precision <- caret::posPredValue(p, y, positive="1")
+recall <- caret::sensitivity(p, y, positive="1")
+
+F1 <- (2 * precision * recall) / (precision + recall)
+```
+
+```{r}
+lon_raster <- terra::init(wc_prec[[1]], fun = "x")
+lat_raster <- terra::init(wc_prec[[1]], fun = "y")
+
+tt_breeding_binary <-
+  pbapply::pblapply(1:12, function(i){
+    
+    sin_month_raster <- wc_prec[[i]]
+    cos_month_raster <- wc_prec[[i]]
+    
+    terra::values(sin_month_raster) <-
+      tt_breeding_long$sin_month[tt_breeding_long$month_num == i] %>% 
+      unique
+    
+    terra::values(cos_month_raster) <-
+      tt_breeding_long$cos_month[tt_breeding_long$month_num == i] %>% 
+      unique
+    
+    this_month_vars <-
+      c(sin_month_raster,
+        cos_month_raster,
+        wc_prec[[i]],
+        wc_tmax[[i]],
+        ha_vt_rast_cap[[i]],
+        dl_rast[[i]],
+        lon_raster,
+        lat_raster)
+    
+    names(this_month_vars) <- c("sin_month", "cos_month", "prec", "tmax", "ha_vt_cap", "dl", "Lon", "Lat")
+    
+    breed_raster <- wc_prec[[i]]
+    
+    new_data <- terra::values(this_month_vars)
+    
+    new_data[is.na(new_data)] <- -1000
+    new_data[is.nan(new_data)] <- -1000
+    
+    new_data <- as.data.frame(new_data)
+    
+    names(new_data) <- c("sin_month", "cos_month", "prec", "tmax", "ha_vt_cap", "dl", "Lon", "Lat")
+    
+    new_data$month_num <- i
+    
+    new_values <- 
+      predict(m_gamm, newdata = new_data) %>% 
+      plogis %>% 
+      as.numeric()
+    
+    terra::values(breed_raster) <- new_values
+    
+    breed_raster[is.na(wc_prec[[i]])] <- NA
+    
+    breed_raster[breed_raster>0.5] <- 1
+    breed_raster[breed_raster<0.5] <- 0
+    
+    breed_raster
+    
+  }) %>% 
+  do.call(c, .)
+
+terra::writeRaster(tt_breeding_binary, "tt_breeding_binary.tif")
+```
+
+```{r}
+tt_breeding_binary <- 
+  terra::rast("tt_breeding_binary.tif")
+
+tt_breeding_binary <-
+  terra::project(tt_breeding_binary, 
+                 terra::crs(wc_tmax))
+
+phi_rast <-
+  phiFUN(tempmax = wc_tmax,
+         precip = wc_prec,
+         breed = tt_breeding_binary)
+
+gamma_rast <-
+  gammaFUN(ha_vt_cap = ha_vt_rast_cap,
+           precip = wc_prec,
+           breed = tt_breeding_binary)
+
+f_rast <- 
+  phi_rast*(1-gamma_rast[[c(2:12,1)]])/
+  gamma_rast[[c(2:12,1)]]
+
+max_f <- max(f_model, na.rm = TRUE)
+f_rast[f_rast > max_f] <- max_f
+
+sum_f <- sum(f_rast)
+
+max(f_year$f)
+
+sum_f[sum_f>max(f_year$f)] <- max(f_year$f)
+
+phi_prod <- prod(phi_rast)
+
+lambda_rast2 <- phi_prod + sum_f
+
+lambda_rast <- prod(phi_rast + f_rast)
+```
+
+```{r}
+prec_restrict <-
+  lapply(wc_prec, function(prec){
+    
+    prec[prec > max(train_df$prec) | 
+           prec < min(train_df$prec)] <- 0
+    
+    prec[prec <= max(train_df$prec) & 
+           prec >= min(train_df$prec)] <- 1
+    
+    prec
+    
+  }) %>% 
+  do.call(c, .)
+
+prec_restrict <- sum(prec_restrict) > 1
+
+tmax_restrict <-
+  lapply(wc_tmax, function(tmax){
+    
+    tmax[tmax > max(train_df$tmax) | 
+           tmax < min(train_df$tmax)] <- 0
+    
+    tmax[tmax <= max(train_df$tmax) & 
+           tmax >= min(train_df$tmax)] <- 1
+    
+    tmax
+    
+  }) %>% 
+  do.call(c, .)
+
+tmax_restrict <- sum(tmax_restrict) > 1
+
+ha_vt_restrict <-
+  lapply(ha_vt_rast_cap, function(ha_vt){
+    
+    ha_vt[ha_vt > max(train_df$ha_vt_cap) | 
+           ha_vt < min(train_df$ha_vt_cap)] <- 0
+    
+    ha_vt[ha_vt <= max(train_df$ha_vt_cap) & 
+           ha_vt >= min(train_df$ha_vt_cap)] <- 1
+    
+    ha_vt
+    
+  }) %>% 
+  do.call(c, .)
+
+ha_vt_restrict <- sum(ha_vt_restrict) > 1
+
+dl_restrict <-
+  lapply(dl_rast, function(dl){
+    
+    dl[dl > max(train_df$dl) | 
+           dl < min(train_df$dl)] <- 0
+    
+    dl[dl <= max(train_df$dl) & 
+           dl >= min(train_df$dl)] <- 1
+    
+    dl
+    
+  }) %>% 
+  do.call(c, .)
+
+dl_restrict <- sum(dl_restrict) > 1
+
+restrict_area <-
+  prec_restrict*tmax_restrict*ha_vt_restrict*dl_restrict
+```
+
+```{r}
+lambda_rast <- lambda_rast*restrict_area
+lambda_rast[lambda_rast == 0] <- NA
+
+vars_stack <-
+  c(lambda_rast2, 
+    lambda_rast2>1,
+    sum_f, 
+    phi_prod,
+    terra::mean(ha_vt_rast_cap),
+    max(wc_tmax),
+    sum(wc_prec))
+
+names(vars_stack) <- c("lambda", "lambda_bin", "f", "phi", "ha", "tmax", "prec")
+```
+
+```{r}
+biomas_crop <-
+biomas[biomas$name_biome %in% c("Amazônia", "Caatinga", "Cerrado", "Mata Atlântica", "Pampa", "Pantanal"),] %>% 
+  sf::st_transform(terra::crs(vars_stack))
+
+tt_ext <-
+c(min(TtorquatusDistribution$Lon) - 1,
+  max(TtorquatusDistribution$Lon) + 1,
+  min(TtorquatusDistribution$Lat) - 1,
+  max(TtorquatusDistribution$Lat) + 1)
+
+vars_stack <-
+  vars_stack %>% 
+  terra::crop(tt_ext)
+```
+
+```{r}
+df1 <- terra::as.data.frame(vars_stack[[1]], xy = TRUE, na.rm = FALSE)
+df2 <- terra::as.data.frame(vars_stack[[2]], xy = TRUE, na.rm = FALSE)
+df3 <- terra::as.data.frame(vars_stack[[3]], xy = TRUE, na.rm = FALSE)
+df4 <- terra::as.data.frame(vars_stack[[4]], xy = TRUE, na.rm = FALSE)
+
+p1 <-
+ggplot2::ggplot(df1, ggplot2::aes(x = x, y = y, fill = lambda)) +
+  ggplot2::geom_raster() +
+  ggplot2::geom_point(
+    data = TtorquatusDistribution,
+    ggplot2::aes(x = Lon, y = Lat),
+    inherit.aes = FALSE,
+    size = 1.5) +
+    ggplot2::coord_sf(xlim = tt_ext[c(1,2)], 
+                      ylim = tt_ext[c(3,4)], 
+                      expand = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    midpoint = 1,
+    low = "#2C7BB6",   # blue
+    mid = "white",
+    high = "#D95F0E",  # orange
+    na.value = "transparent",
+    oob = scales::squish
+  ) +
+  ggplot2::labs(fill = expression(lambda)) +
+  ggplot2::theme_classic()
+
+p2 <-
+ggplot2::ggplot(df2, ggplot2::aes(x = x, y = y, fill = lambda_bin)) +
+  ggplot2::geom_raster() +
+  ggplot2::geom_point(
+    data = TtorquatusDistribution,
+    ggplot2::aes(x = Lon, y = Lat),
+    inherit.aes = FALSE,
+    size = 1.5) +
+    ggplot2::coord_sf(xlim = tt_ext[c(1,2)], 
+                      ylim = tt_ext[c(3,4)], 
+                      expand = FALSE) +
+  ggplot2::scale_fill_gradient(
+    low = "#2C7BB6",   # blue
+    high = "#D95F0E",  # orange
+    na.value = "transparent",
+    oob = scales::squish
+  ) +
+  ggplot2::labs(fill = expression(lambda_bin)) +
+  ggplot2::theme_classic()
+
+p3 <-
+ggplot2::ggplot(df3, ggplot2::aes(x = x, y = y, fill = f)) +
+  ggplot2::geom_raster() +
+  ggplot2::geom_point(
+    data = TtorquatusDistribution,
+    ggplot2::aes(x = Lon, y = Lat),
+    inherit.aes = FALSE,
+    size = 1.5) +
+    ggplot2::coord_sf(xlim = tt_ext[c(1,2)], 
+                      ylim = tt_ext[c(3,4)], 
+                      expand = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    midpoint = 1,
+    low = "#2C7BB6",   # blue
+    mid = "white",
+    high = "#D95F0E",  # orange
+    na.value = "transparent",
+    oob = scales::squish
+  ) +
+  ggplot2::labs(fill = expression(f)) +
+  ggplot2::theme_classic()
+
+p4 <-
+ggplot2::ggplot(df4, ggplot2::aes(x = x, y = y, fill = phi)) +
+  ggplot2::geom_raster() +
+  ggplot2::geom_point(
+    data = TtorquatusDistribution,
+    ggplot2::aes(x = Lon, y = Lat),
+    inherit.aes = FALSE,
+    size = 1.5) +
+    ggplot2::coord_sf(xlim = tt_ext[c(1,2)], 
+                      ylim = tt_ext[c(3,4)], 
+                      expand = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    midpoint = 0.5,
+    low = "#2C7BB6",   # blue
+    mid = "white",
+    high = "#D95F0E",  # orange
+    na.value = "transparent",
+    oob = scales::squish
+  ) +
+  ggplot2::labs(fill = expression(phi)) +
+  ggplot2::theme_classic()
+
+gridExtra::grid.arrange(p4,p3,p1,p2)
+```
+
+```{r}
+pres <- 
+  terra::vect(TtorquatusDistribution[-1], 
+              geom = c("Lon", "Lat"), 
+              crs = terra::crs(vars_stack))
+
+pres_values <-
+  terra::extract(vars_stack, 
+                 pres)
+
+pres_values$pres <- 1
+
+pres <- pres[complete.cases(pres_values),]
+pres_values <- pres_values[complete.cases(pres_values),]
+```
+
+```{r}
+M_km <- 200
+M <- terra::buffer(pres, 
+                   width = M_km * 1000)
+M <- terra::aggregate(M)                 
+env_M <- terra::mask(vars_stack, M)
+
+set.seed(1)
+n_bg <- 10 * nrow(pres)
+
+abs <- 
+  terra::spatSample(x = env_M[[1]], 
+                    size = n_bg, 
+                    method = "random",
+                    as.points = TRUE, 
+                    na.rm = TRUE, 
+                    values = FALSE)
+
+abs_values <-
+  terra::extract(vars_stack, 
+                 abs)
+
+abs_values$pres <- 0
+
+tt_df <- 
+  rbind(pres_values, abs_values) %>% 
+  as.data.frame()
+```
+
+```{r}
+# lam_pres: numeric vector of lambda at presence points
+# lam_bg:   numeric vector of lambda at background points
+
+lam_pres <- tt_df$lambda[tt_df$pres == 1]
+lam_bg <- tt_df$lambda[tt_df$pres == 0]
+
+lam_pres <- lam_pres[is.finite(lam_pres)]
+lam_bg   <- lam_bg[is.finite(lam_bg)]
+
+w <- stats::wilcox.test(lam_pres, lam_bg, alternative = "greater", exact = FALSE)
+print(w)
+
+# Effect size (AUC / common-language effect):
+# P(lambda_presence > lambda_background)
+U <- as.numeric(w$statistic)
+auc_effect <- U / (length(lam_pres) * length(lam_bg))
+cat("Effect (P[pres > bg]) =", round(auc_effect, 3), "\n")
+cat("Medians: pres =", round(stats::median(lam_pres), 3),
+    " bg =", round(stats::median(lam_bg), 3), "\n")
+
+```
+
+```{r}
+set.seed(42)
+
+x <- c(lam_pres, lam_bg)
+g <- c(rep(1, length(lam_pres)), rep(0, length(lam_bg)))
+
+obs <- stats::median(lam_pres) - stats::median(lam_bg)
+
+B <- 2000
+perm <- replicate(B, {
+  gp <- sample(g)
+  stats::median(x[gp == 1]) - stats::median(x[gp == 0])
+})
+
+p_one_sided <- mean(perm >= obs)
+cat("Observed Δmedian =", round(obs, 3), "\n")
+cat("Permutation p (pres > bg) =", round(p_one_sided, 4), "\n")
+
+```
+
+```{r}
+xy_pres <- terra::crds(pres)
+xy_bg   <- terra::crds(abs)
+xy <- rbind(xy_pres, xy_bg)
+tt_df$x <- xy[,1]
+tt_df$y <- xy[,2]
+
+sf_pts <- 
+  sf::st_as_sf(tt_df, 
+               coords = c("x","y"), 
+               crs = terra::crs(env_M))
+
+block_km <- 50
+
+set.seed(1)
+
+cv <- blockCV::cv_spatial(
+  x = sf_pts,
+  column = "pres",
+  r = vars_stack,
+  k = 5,
+  size = block_km * 1000, 
+  selection = "random",
+  iteration = 50,
+  progress = FALSE
+)
+
+folds <- cv$folds_list
+```
+
+```{r}
+eval_metrics <- function(y_true, p_score){
+  auc <- as.numeric(pROC::auc(y_true, p_score))
+  pres_scores <- p_score[y_true == 1]
+  bg_scores   <- p_score[y_true == 0]
+  pr <- PRROC::pr.curve(scores.class0 = pres_scores, scores.class1 = bg_scores, curve = FALSE)
+  prauc <- as.numeric(pr$auc.integral)
+  c(AUC = auc, PRAUC = prauc)
+}
+
+fit_rf <- function(train_df, vars){
+  y <- as.factor(train_df$pres)
+  n1 <- sum(train_df$pres == 1)
+  n0 <- sum(train_df$pres == 0)
+  ss <- rep(min(n1, n0), 2)
+  
+  randomForest::randomForest(
+    x = train_df[, vars, drop=FALSE],
+    y = y,
+    ntree = 500,
+    sampsize = ss,
+    importance = TRUE
+  )
+}
+
+pred_prob1 <- function(model, new_df, vars){
+  stats::predict(model, newdata = new_df[, vars, drop=FALSE], type = "prob")[, "1"]
+}
+```
+
+```{r}
+clim_vars <- c("ha", "tmax", "prec")
+demo_vars <- c("lambda", "f", "phi")
+
+res <- data.frame(fold=integer(), model=character(), AUC=double(), PRAUC=double())
+
+for (i in seq_along(folds)){
+  test_idx  <- folds[[i]][[1]]
+  train_idx <- setdiff(seq_len(nrow(tt_df)), test_idx)
+  
+  train <- tt_df[train_idx, ]
+  test  <- tt_df[test_idx, ]
+  
+  y_test <- test$pres
+  
+  # 3 model sets
+  mods <- list(
+    climate = clim_vars,
+    demo    = demo_vars,
+    both    = c(clim_vars, demo_vars)
+  )
+  
+  for (m in names(mods)){
+    vars <- mods[[m]]
+    rf <- fit_rf(train, vars)
+    p  <- pred_prob1(rf, test, vars)
+    met <- eval_metrics(y_test, p)
+    res <- rbind(res, data.frame(fold=i, model=m, AUC=met["AUC"], PRAUC=met["PRAUC"]))
+  }
+}
+
+summary_table <- aggregate(cbind(AUC, PRAUC) ~ model, data = res,
+                           FUN = function(x) c(mean=mean(x), sd=stats::sd(x)))
+summary_table
+```
+
+```{r}
+wide_auc <- reshape(res[, c("fold","model","AUC")], idvar="fold", timevar="model", direction="wide")
+wide_pr  <- reshape(res[, c("fold","model","PRAUC")], idvar="fold", timevar="model", direction="wide")
+
+delta_auc <- mean(wide_auc$AUC.both - wide_auc$AUC.climate, na.rm=TRUE)
+delta_pr  <- mean(wide_pr$PRAUC.both - wide_pr$PRAUC.climate, na.rm=TRUE)
+
+cat("\nMean improvement (both - climate):",
+    "\n  ΔAUC   =", round(delta_auc, 3),
+    "\n  ΔPRAUC =", round(delta_pr, 3), "\n")
+```
+
+```{r}
+lam_pres <- tt_df$lambda[tt_df$pres == 1]
+lam_bg   <- tt_df$lambda[tt_df$pres == 0]
+
+qs <- stats::quantile(lam_bg, probs = seq(0, 1, 0.1), na.rm=TRUE)
+pres_in_bin <- sapply(2:length(qs), function(j){
+  mean(lam_pres > qs[j-1] & lam_pres <= qs[j], na.rm=TRUE)
+})
+bg_in_bin <- sapply(2:length(qs), function(j){
+  mean(lam_bg > qs[j-1] & lam_bg <= qs[j], na.rm=TRUE)
+})
+
+enrich <- pres_in_bin / bg_in_bin
+enrich_df <- data.frame(decile = 1:10, enrich = enrich)
+enrich_df
+```
+
+```{r}
+plot(enrich_df$decile, enrich_df$enrich, type="b",
+     xlab="Lambda decile (based on background)", ylab="Presence enrichment (ratio)")
+abline(h=1, lty=2)
+```
